@@ -1,5 +1,10 @@
 --!strict
 
+--[[
+P.S : I re-applied with this script again for advanced because i had no idea there would be different levels to scripting in the RoDevs Discord Server,
+I've also contacted a "helper" on the server who confirmed i was able to re-apply with a script i've used before on an application. (it was the beginner one)
+]]
+
 local ServerScriptService = game:GetService("ServerScriptService")
 local MemoryStoreService = game:GetService("MemoryStoreService")
 local TeleportService = game:GetService("TeleportService")
