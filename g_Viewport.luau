@@ -5,20 +5,19 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
---// MODULE DECLARATION
 local ViewportManager = {}
 
---// INTERNAL STATE & ENGINES
-local ROTATION_SPEED = 50
-local RETURN_TIME = 0.4
+-- Constant configuration for a uniform UI feel across the app
+local ROTATION_SPEED = 50 
+local RETURN_TIME = 0.4 
+
+-- Tracking tables: We use the ViewportFrame instance as the key.
+-- This allows us to map specific data/connections to specific UI elements without mixing them up.
 local currentlyHoveredVpf: ViewportFrame? = nil
+local defaultCFrames: {[ViewportFrame]: CFrame} = {} 
+local draggableConnections: {[ViewportFrame]: {RBXScriptConnection}} = {} 
+local activeReturnTweens: {[ViewportFrame]: Tween} = {} 
 
-local defaultCFrames: {[ViewportFrame]: CFrame} = {}
-local draggableConnections: {[ViewportFrame]: {RBXScriptConnection}} = {}
-local activeReturnTweens: {[ViewportFrame]: Tween} = {}
-
-
---// FORWARD DECLARE THE OPTIONS TYPE FOR HELPER FUNCTIONS
 export type CreateOptions = {
 	Parent: GuiObject,
 	ItemData: {[string]: any},
@@ -29,7 +28,7 @@ export type CreateOptions = {
 	EnableDrag: boolean?
 }
 
--- Creates a draggable viewport
+-- Setup for the inspection view (where players can rotate/zoom the item)
 local function createDraggableViewport(options: CreateOptions)
 	local viewport = options.Viewport or Instance.new("ViewportFrame")
 	if not options.Viewport then
@@ -37,15 +36,18 @@ local function createDraggableViewport(options: CreateOptions)
 	end
 	viewport.Parent = options.Parent
 
-	-- Setup WorldModel, Camera, and Effects
+	-- We use WorldModel because it allows us to run physics/animations 
+	-- inside the ViewportFrame, which a standard Folder doesn't support well.
 	local world = Instance.new("WorldModel")
 	world.Parent = viewport
 
+	-- Camera is Scriptable so we can manually calculate its position in 3D space
 	local camera = Instance.new("Camera")
 	camera.CameraType = Enum.CameraType.Scriptable
 	camera.Parent = viewport
 	viewport.CurrentCamera = camera
 
+	-- Post-processing: Boosting contrast/brightness makes models pop against dark UI backgrounds
 	local colorCorrection = Instance.new("ColorCorrectionEffect")
 	colorCorrection.Brightness = 0.1
 	colorCorrection.Contrast = 0.15
@@ -56,25 +58,29 @@ local function createDraggableViewport(options: CreateOptions)
 	local modelSize: Vector3
 	local modelCenter: Vector3
 
-	-- Model/Animation Handling
 	if options.Model then
 		camera.FieldOfView = 45
 		clone = options.Model:Clone()
 		clone.Parent = world
 
+		-- PrimaryPart is essential for PivotTo logic; fallback to first part found
 		if not clone.PrimaryPart then
 			clone.PrimaryPart = clone:FindFirstChildWhichIsA("BasePart")
 		end
 
+		-- GetBoundingBox gives us the size and world-center of the model.
+		-- This is crucial for centering the camera so the model doesn't "wobble" when rotating.
 		local cf, size = clone:GetBoundingBox()
 		modelSize = size
 		modelCenter = cf.Position
+		
+		-- Adjust initial rotation based on weapon type so the "best" side faces the player
 		local facing = (options.ItemData.DualWield == true) and CFrame.Angles(0, math.rad(65), 0) or CFrame.Angles(0, math.rad(-115), 0)
 		clone:PivotTo(CFrame.new(-modelCenter) * facing)
 		modelCenter = clone:GetPivot().Position
 	end
 
-	-- Advanced Lighting
+	-- Darken lighting for unowned items, brighten for owned ones.
 	if options.IsOwned then
 		viewport.BackgroundColor3 = Color3.fromRGB(156, 156, 156)
 		viewport.LightColor = Color3.fromRGB(232, 232, 232)
@@ -85,6 +91,7 @@ local function createDraggableViewport(options: CreateOptions)
 		viewport.Ambient = Color3.fromRGB(8, 8, 8)
 	end
 
+	-- Dynamic light rig: We use multiple point lights to create depth (shadows/highlights)
 	local function createLight(parent: Instance, name: string, pos: Vector3, brightness: number, range: number, color: Color3?)
 		local part = Instance.new("Part", parent)
 		part.Name = name; part.Transparency = 1; part.Anchored = true; part.CanCollide = false
@@ -101,29 +108,29 @@ local function createDraggableViewport(options: CreateOptions)
 	createLight(lightRig, "RimLight", modelCenter + Vector3.new(0, 1, -6), 1.8, 30, Color3.fromRGB(255, 255, 255))
 	createLight(lightRig, "UnderLight", modelCenter + Vector3.new(0, -5, 2), 1.2, 30)
 
-	-- Dynamic Zoom & Camera Positioning
+	-- Distance Calc: Uses trigonometry to ensure the model fits perfectly in the frame.
+	-- We divide the radius by the tangent of half the FOV to find the adjacent side (distance).
 	local modelRadius = math.max(modelSize.X, modelSize.Y, modelSize.Z) / 2
 	local zoomMultiplier = (options.ItemData.DualWield and 1.4) or (options.ItemData.Type == "WinAnimation" and 1.5) or 0.9
 	local zoom = (modelRadius * zoomMultiplier) / math.tan(math.rad(camera.FieldOfView / 2))
-	local minZoom = zoom * 0.5
-	local maxZoom = zoom * 2.5
+	local minZoom, maxZoom = zoom * 0.5, zoom * 2.5
 
-	-- Rotation and Input State
 	local yaw, pitch = 0, 0
 	local pitchLimits = NumberRange.new(math.rad(-60), math.rad(60))
 	local dragging = false
 
+	-- Updates the camera CFrame by rotating the offset vector (zoom) around the center point.
 	local function updateCamera()
 		pitch = math.clamp(pitch, pitchLimits.Min, pitchLimits.Max)
 		camera.CFrame = CFrame.Angles(pitch, yaw, 0) * CFrame.new(0, 0, zoom) + modelCenter
 	end
 	updateCamera()
 
-	-- Store all connections for later cleanup
+	-- Store connections so we can kill them later—crucial for preventing "ghost" loops.
 	local connections = {}
 	draggableConnections[viewport] = connections
 
-	-- Floating animation
+	-- Add a sine-wave hover to the model to make the UI feel less static.
 	local t = 0
 	local initialPivot = clone:GetPivot()
 	table.insert(connections, RunService.Heartbeat:Connect(function(dt)
@@ -134,7 +141,7 @@ local function createDraggableViewport(options: CreateOptions)
 		end
 	end))
 
-	-- Input Handling
+	-- Lock the mouse when dragging so the player can keep rotating without the cursor hitting the screen edge.
 	table.insert(connections, viewport.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			dragging = true
@@ -149,12 +156,14 @@ local function createDraggableViewport(options: CreateOptions)
 		end
 	end))
 
+	-- Map mouse movement (Delta) to world-space rotation (Yaw/Pitch).
 	table.insert(connections, RunService.RenderStepped:Connect(function(dt)
 		if dragging then
 			local delta = UserInputService:GetMouseDelta()
 			yaw -= delta.X * 0.01
 			pitch -= delta.Y * 0.01
 		else
+			-- Smoothing: Return to original viewing angle when user lets go.
 			local returnSpeed = 7
 			yaw = yaw + (0 - yaw) * returnSpeed * dt
 			pitch = pitch + (0 - pitch) * returnSpeed * dt
@@ -164,6 +173,7 @@ local function createDraggableViewport(options: CreateOptions)
 		updateCamera()
 	end))
 
+	-- Mouse wheel input directly modifies the 'zoom' variable used in updateCamera.
 	table.insert(connections, viewport.InputChanged:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseWheel then
 			zoom = math.clamp(zoom - input.Position.Z * (modelRadius * 0.05), minZoom, maxZoom)
@@ -174,12 +184,15 @@ local function createDraggableViewport(options: CreateOptions)
 	return viewport
 end
 
+-- Optimization: One Heartbeat connection handles ALL viewports.
+-- We only process the viewport that the mouse is currently over to save CPU cycles.
 RunService.Heartbeat:Connect(function(deltaTime: number)
 	if currentlyHoveredVpf then
 		local world = currentlyHoveredVpf:FindFirstChildOfClass("WorldModel")
 		if not world then return end
 		local model = world:FindFirstChildOfClass("Model")
-		-- Only rotate if the model exists and isn't currently tweening back to its default state.
+		
+		-- Rotation check: Don't rotate if the model is currently being tweened back to center.
 		if model and not activeReturnTweens[currentlyHoveredVpf] then
 			local rotationAmount = CFrame.Angles(0, math.rad(ROTATION_SPEED * deltaTime), 0)
 			model:PivotTo(rotationAmount * model:GetPivot())
@@ -187,8 +200,10 @@ RunService.Heartbeat:Connect(function(deltaTime: number)
 	end
 end)
 
+-- Smoothly resets orientation.
+-- Since you can't tween a Model's pivot directly, we tween a CFrameValue 
+-- and update the model pivot on every frame of that tween.
 local function onHoverLeave(viewport: ViewportFrame)
-	-- If a return tween is already playing, don't start another one.
 	if activeReturnTweens[viewport] then return end
 
 	local world = viewport:FindFirstChildOfClass("WorldModel")
@@ -204,12 +219,10 @@ local function onHoverLeave(viewport: ViewportFrame)
 	end)
 
 	local tween = TweenService:Create(cframeProxy, TweenInfo.new(RETURN_TIME, Enum.EasingStyle.Sine), {Value = defaultCFrames[viewport]})
-
-	-- Track the active tween so it can be cancelled if needed.
 	activeReturnTweens[viewport] = tween
 
+	-- Cleanup: disconnect the proxy listener once the tween is finished.
 	tween.Completed:Connect(function()
-		-- Stop tracking the tween once it has finished.
 		activeReturnTweens[viewport] = nil
 		connection:Disconnect()
 		cframeProxy:Destroy()
@@ -218,13 +231,11 @@ local function onHoverLeave(viewport: ViewportFrame)
 end
 
 
---// PUBLIC API
 function ViewportManager.create(options: CreateOptions): GuiObject
-
 	local parentButton = options.Parent
 	local itemData = options.ItemData
 
-	--// ITEM USES A 2D IMAGE
+	-- If the item data specifies a 2D icon, skip 3D rendering entirely to save performance.
 	if itemData.UseImage then
 		local imageLabel = Instance.new("ImageLabel")
 		imageLabel.Name = "ItemImage"
@@ -235,12 +246,10 @@ function ViewportManager.create(options: CreateOptions): GuiObject
 		return imageLabel
 	end
 
-	--// ITEM USES A 3D VIEWPORT
 	if options.EnableDrag then
-		-- ADVANCED DRAGGABLE VIEWPORT
 		return createDraggableViewport(options)
 	else
-		-- STANDARD HOVER-ROTATE VIEWPORT
+		-- Default Viewport (Auto-rotates on hover)
 		local itemModel = options.Model
 		local isOwned = options.IsOwned
 		local hoverDisabled = options.HoverDisabled
@@ -268,16 +277,21 @@ function ViewportManager.create(options: CreateOptions): GuiObject
 
 			clone:PivotTo(CFrame.new())
 			local cf, size = clone:GetBoundingBox()
+			
+			-- Angle adjustments depending on itemData
 			local facing = (itemData.DualWield == true) and CFrame.Angles(0, math.rad(35), 0)
 				or itemData.Contract and CFrame.Angles(math.rad(60), math.rad(15), math.rad(-30)) or CFrame.Angles(0, math.rad(-115), 0)
 			clone:PivotTo(facing)
 
+			-- Save initial orientation for the reset-tween later.
 			defaultCFrames[viewport] = clone:GetPivot()
 
+			-- Positioning the camera based on model magnitude so nothing is "cutoff" the frame.
 			local distance = (size.Magnitude / 2.2) / math.tan(math.rad(camera.FieldOfView / 2))
 			camera.CFrame = CFrame.new(cf.Position + Vector3.new(0, 0, distance), cf.Position)
 		end
 
+		-- Lighting contrast helps separate "locked" items from "unlocked" ones visually.
 		if isOwned then
 			viewport.LightColor = Color3.fromRGB(232, 232, 232)
 			viewport.Ambient = Color3.fromRGB(255, 255, 255)
@@ -287,20 +301,17 @@ function ViewportManager.create(options: CreateOptions): GuiObject
 		end
 
 		if itemModel and not hoverDisabled then
-			-- Mouse event logic for flicker-free transitions
 			parentButton.MouseEnter:Connect(function()
-				-- If a "return" tween is playing, cancel it immediately to prevent flickering.
+				-- Stop any active "reset" tweens if the mouse re-enters.
 				if activeReturnTweens[viewport] then
 					activeReturnTweens[viewport]:Cancel()
 					activeReturnTweens[viewport] = nil
 				end
-				-- Set this viewport as the one to be rotated by the central Heartbeat connection.
 				currentlyHoveredVpf = viewport
 			end)
 
 			parentButton.MouseLeave:Connect(function()
-				-- Only trigger the "leave" logic if the mouse is leaving THIS specific viewport.
-				-- This prevents issues when moving quickly between two viewports.
+				-- Only trigger the leave logic for the specific viewport being exited.
 				if currentlyHoveredVpf == viewport then
 					currentlyHoveredVpf = nil
 					onHoverLeave(viewport)
@@ -312,6 +323,8 @@ function ViewportManager.create(options: CreateOptions): GuiObject
 	end
 end
 
+-- Cleanup: This is arguably the most important part of the module.
+-- It wipes all table references and kills script connections so the Garbage Collector can free up RAM.
 function ViewportManager.cleanup(parentButton: GuiObject, preserveViewport : boolean?)
 	if not parentButton then return end
 
@@ -319,30 +332,31 @@ function ViewportManager.cleanup(parentButton: GuiObject, preserveViewport : boo
 	local image = parentButton:FindFirstChild("ItemImage")
 
 	if viewport then
-		-- Cancel any active return tween during cleanup.
+		-- Kill any tweens currently modifying the model to prevent errors on destroyed objects.
 		if activeReturnTweens[viewport] then
 			activeReturnTweens[viewport]:Cancel()
 			activeReturnTweens[viewport] = nil
 		end
 
-		-- Cleanup for standard hover-rotate viewports
+		-- Clear state table references
 		defaultCFrames[viewport] = nil
 		if viewport == currentlyHoveredVpf then
 			currentlyHoveredVpf = nil
 		end
 
-		-- Cleanup for advanced draggable viewports
+		-- Disconnect all input listeners stored for this specific viewport.
 		if draggableConnections[viewport] then
 			for _, conn in ipairs(draggableConnections[viewport]) do
 				conn:Disconnect()
 			end
-			draggableConnections[viewport] = nil -- Clear the entry
+			draggableConnections[viewport] = nil 
 			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
 		end
 
 		if not preserveViewport then
 			viewport:Destroy()
 		elseif preserveViewport then
+			-- If we keep the viewport (recycling UI), clear children to remove the old WorldModel/Lights.
 			viewport:ClearAllChildren()
 		end
 	end
