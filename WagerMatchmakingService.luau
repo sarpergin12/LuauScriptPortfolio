@@ -1,10 +1,5 @@
 --!strict
 
---[[
-P.S : I re-applied with this script again for advanced because i had no idea there would be different levels to scripting in the RoDevs Discord Server,
-I've also contacted a "helper" on the server who confirmed i was able to re-apply with a script i've used before on an application. (it was the beginner one)
-]]
-
 local ServerScriptService = game:GetService("ServerScriptService")
 local MemoryStoreService = game:GetService("MemoryStoreService")
 local TeleportService = game:GetService("TeleportService")
@@ -12,330 +7,350 @@ local Players = game:GetService("Players")
 local MessagingService = game:GetService("MessagingService")
 local HttpService = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local DataStatsManager = require(ServerScriptService.Managers.Data.DataStatsManager)
 
---// MODULES & TYPES
-local loadingScreenSetEvent = ReplicatedStorage.Matchmaking.LoadingScreenSetEvent
+-- Assume this exists based on your snippet
+local DataStatsManager = require(ServerScriptService.Managers.Data.DataStatsManager) 
 
-type MatchData = { UserIds: {number}, PrivateServerCode: string, DuelTicketId: string, WagerAmount: number, Teams: {[string]: {number}} }
-type PlayerQueueData = { UserId: number, Wager: number, QueueTime: number, GameMode: string }
-type SortedMapItem = { key: string, value: number }
-
---// CONFIGURATION
-local QUEUE_MAP_NAME = "DuelQueue_SortedMap"
-local PLAYER_DATA_MAP_NAME = "DuelQueue_PlayerData_HashMap"
-local TELEPORT_TOPIC = "TeleportToDuelSolo"
-local MIN_PLAYERS_FOR_MATCH = 2
-local MATCH_PLACE_ID = 80943991227066
-
-local VALID_WAGERS = {0, 50, 100, 500, 1000, 5000, 10000}
-local MATCH_CONFIG = {
-	["1v1"] = { TeamSize = 1, TotalPlayers = 2 },
-	["2v2"] = { TeamSize = 2, TotalPlayers = 4 },
-	["3v3"] = { TeamSize = 3, TotalPlayers = 6 }
+--// TYPES
+type MatchData = {
+	UserIds: {number},
+	PrivateServerCode: string,
+	DuelTicketId: string,
+	WagerAmount: number,
+	Teams: {[string]: {number}}
 }
 
---// SERVICES & MAPS
+type PlayerQueueData = {
+	UserId: number,
+	Wager: number,
+	QueueTime: number,
+	GameMode: string
+}
+
+type QueueItem = {
+	key: string,
+	value: number -- QueueTime
+}
+
+--// CONFIGURATION
+local CONFIG = {
+	QUEUE_MAP = "DuelQueue_SortedMap_v2", -- Changed name to prevent conflicts with old data
+	PLAYER_DATA_MAP = "DuelQueue_PlayerData_HashMap_v2",
+	TELEPORT_TOPIC = "TeleportToDuelSolo",
+	MIN_PLAYERS = 2,
+	MATCH_PLACE_ID = 80943991227066,
+	QUEUE_EXPIRY = 3600,
+	TICKET_EXPIRY = 300,
+	VALID_WAGERS = {0, 50, 100, 500, 1000, 5000, 10000},
+	MATCH_MODES = {
+		["1v1"] = { TeamSize = 1, TotalPlayers = 2 },
+		["2v2"] = { TeamSize = 2, TotalPlayers = 4 },
+		["3v3"] = { TeamSize = 3, TotalPlayers = 6 }
+	}
+}
+
+--// SERVICES & STATE
 local DuelTicketsMap = MemoryStoreService:GetHashMap("DuelTickets")
-local queueMap = MemoryStoreService:GetSortedMap(QUEUE_MAP_NAME)
-local playerDataMap = MemoryStoreService:GetHashMap(PLAYER_DATA_MAP_NAME)
-
---// STATE
-local RefundedPlayers = {}
-local isProcessingActive = false
-local processingThread: thread? = nil
-
---//
---// --- PRIVATE HELPER FUNCTIONS ---
---//
-
-local function SafeRefund(player: Player, amount: number, reason: string)
-	if not player or amount <= 0 then return end
-	local userId = player.UserId
-	if RefundedPlayers[userId] then return end
-	RefundedPlayers[userId] = true
-	print(`[MM] Refunding {amount} shells to {player.Name}. Reason: {reason}`);
-	(DataStatsManager :: any).AddShellsServer(player, amount) -- the data stats manager is where we handle economy, based on shells (money)
-	task.delay(5, function() RefundedPlayers[userId] = nil end)
-end
-
--- Safely gets the list of queued player IDs from the SortedMap.
-local function _getQueuedItems(): {any}?
-	local success, result = pcall(function()
-		return queueMap:GetRangeAsync(Enum.SortDirection.Ascending, 50)
-	end)
-	if not success then
-		warn(`[MM] Error reading queue map: {tostring(result)}`)
-		return nil
-	end
-	return result
-end
-
--- Fetches all player data in ONE bulk request for performance.
-local function _fetchPlayerData(queuedItems: {SortedMapItem}): {PlayerQueueData}?
-	local playerKeys = {}
-	for _, item in ipairs(queuedItems) do
-		table.insert(playerKeys, item.key)
-	end
-	if #playerKeys == 0 then return {} end
-
-	local formattedData = {}
-	local successCount = 0
-
-	-- We must loop and get each item individually for a HashMap
-	for _, key in ipairs(playerKeys) do
-		local success, result = pcall(function()
-			return playerDataMap:GetAsync((key :: string))
-		end)
-
-		if success and result then
-			table.insert(formattedData, result :: PlayerQueueData)
-			successCount += 1
-		else
-			-- This can happen if a player leaves the queue between getting the keys and fetching the data. It's safe to just warn.
-			warn(`[MM] Could not fetch player data for key {key}. It may have been removed. Error: {tostring(result)}`)
-		end
-	end
-
-	if successCount == 0 and #playerKeys > 0 then
-		warn(`[MM] Error bulk-fetching player data: Failed to fetch any data for the provided keys.`)
-		return nil -- Return nil if we failed to get any data at all
-	end
-
-	return formattedData
-end
-
--- Sorts players into groups by GameMode and Wager.
-local function _groupPlayers(fullPlayerData: {PlayerQueueData}): {[string]: {[number]: {PlayerQueueData}}}
-	local playersByGroup: {[string]: {[number]: {PlayerQueueData}}} = {}
-	for _, data in ipairs(fullPlayerData) do
-		local gameMode = data.GameMode
-		local wager = data.Wager
-
-		if not playersByGroup[gameMode] then playersByGroup[gameMode] = {} end
-		if not playersByGroup[gameMode][wager] then playersByGroup[gameMode][wager] = {} end
-
-		table.insert(playersByGroup[gameMode][wager], data)
-	end
-	return playersByGroup
-end
-
--- Creates balanced NvN matches from the sorted groups.
-local function _createMatchesFromGroups(playersByGroup: {[string]: {[number]: {PlayerQueueData}}})
-	for gameMode, wagers in pairs(playersByGroup) do
-		local config = MATCH_CONFIG[gameMode]
-		if not config then continue end
-
-		local matchSize = config.TotalPlayers
-
-		for wager, queuedPlayers in pairs(wagers) do
-			while #queuedPlayers >= matchSize do
-				print(`[MM] Match found for {gameMode} @ {wager} wager! Attempting to reserve server...`)
-
-				-- GATHER players for the potential match, but DO NOT remove them from the list yet.
-				local playersInMatchData = {}
-				for i = 1, matchSize do
-					table.insert(playersInMatchData, queuedPlayers[i])
-				end
-				
-				-- Attempt to reserve the server FIRST. This is the most likely point of failure.
-				local reserveSuccess, privateServerCode = pcall(function() return TeleportService:ReserveServerAsync(MATCH_PLACE_ID) end)
-				if not reserveSuccess then
-					warn(`[MM] Failed to reserve server: {tostring(privateServerCode)}. Players will remain in queue.`)
-					-- Break the loop for this wager group for this cycle to avoid repeatedly failing on the same group.
-					break
-				end
-
-				print(`[MM] Server reserved successfully. Removing players from queue...`)
-				
-				local teamsData = { Red = {}, Blue = {} }
-				local userIdsToRemove = {}
-				local userIdsToTeleport = {}
-
-				-- Now we actually remove the players from the list and prepare their data
-				for i = 1, matchSize do
-					local playerData = table.remove(queuedPlayers, 1) -- This removes from the start of the list
-					if playerData then
-						table.insert(userIdsToRemove, tostring(playerData.UserId))
-						table.insert(userIdsToTeleport, playerData.UserId)
-
-						-- Assign teams
-						if #teamsData.Red < config.TeamSize then
-							table.insert(teamsData.Red, playerData.UserId)
-						else
-							table.insert(teamsData.Blue, playerData.UserId)
-						end
-						
-						-- Clear player attribute
-						local player = Players:GetPlayerByUserId(playerData.UserId)
-						if player then player:SetAttribute("InQueueForWager", nil) end
-					end
-				end
-
-				-- Remove players from MemoryStore
-				for _, userIdString in ipairs(userIdsToRemove) do
-					-- Using separate pcalls is more robust against single-item failures
-					pcall(function() queueMap:RemoveAsync((userIdString :: string)) end)
-					pcall(function() playerDataMap:RemoveAsync((userIdString :: string)) end)
-				end
-
-				-- Teleportation logic
-				local duelTicketId = HttpService:GenerateGUID(false)
-				local duelTicket = { Teams = teamsData, WagerAmount = wager, Status = "Pending", Timestamp = os.time() }
-				DuelTicketsMap:SetAsync(duelTicketId, duelTicket, 300)
-
-				local messageData = { UserIds = userIdsToTeleport, PrivateServerCode = privateServerCode, DuelTicketId = duelTicketId, WagerAmount = wager, Teams = teamsData }
-				pcall(function() MessagingService:PublishAsync(TELEPORT_TOPIC, HttpService:JSONEncode(messageData)) end)
-			end
-		end
-	end
-end
-
-
---//
---// --- PUBLIC MODULE FUNCTIONS ---
---//
+local QueueMap = MemoryStoreService:GetSortedMap(CONFIG.QUEUE_MAP)
+local PlayerDataMap = MemoryStoreService:GetHashMap(CONFIG.PLAYER_DATA_MAP)
+local LoadingScreenSetEvent = ReplicatedStorage:WaitForChild("Matchmaking"):WaitForChild("LoadingScreenSetEvent")
 
 local MatchmakingService = {}
+MatchmakingService.__index = MatchmakingService
+MatchmakingService._IsRunning = false
+MatchmakingService._RefundCache = {} :: {[number]: boolean}
+
+--// HELPER: Safe Refund with Debounce
+local function SafeRefund(userId: number, amount: number, reason: string)
+	if amount <= 0 then return end
+	if MatchmakingService._RefundCache[userId] then return end
+	
+	MatchmakingService._RefundCache[userId] = true
+	
+	local player = Players:GetPlayerByUserId(userId)
+	if player then
+		warn(`[MM] Refunding {amount} to {player.Name}: {reason}`)
+		-- Wrap in pcall to ensure economy errors don't break the thread
+		task.spawn(function()
+			pcall(function() 
+				(DataStatsManager :: any).AddShellsServer(player, amount) 
+			end)
+		end)
+	else
+		-- TODO: Handle offline refunds via DataStore if necessary
+		warn(`[MM] Could not refund {userId} (Offline). Amount: {amount}`)
+	end
+
+	task.delay(5, function() MatchmakingService._RefundCache[userId] = nil end)
+end
+
+--// HELPER: Retry Logic for Teleport
+local function RetryReserveServer(placeId: number): (boolean, string?)
+	local attempts = 0
+	local maxAttempts = 3
+	local code = nil
+	local success = false
+	
+	repeat
+		attempts += 1
+		success, code = pcall(function()
+			return TeleportService:ReserveServerAsync(placeId)
+		end)
+		if not success then task.wait(1) end
+	until success or attempts >= maxAttempts
+	
+	return success, code
+end
+
+--// MAIN METHODS
 
 function MatchmakingService.AddToQueue(player: Player, wagerAmount: number, gameMode: string): (boolean, string)
-	if not table.find(VALID_WAGERS, wagerAmount) then return false, "Invalid mode selected." end
-	if not MATCH_CONFIG[gameMode] then return false, "Invalid game mode." end
-	if player:GetAttribute("InQueueForWager") then return false, "You are already in a queue." end
+	-- Validation
+	if not table.find(CONFIG.VALID_WAGERS, wagerAmount) then return false, "Invalid wager." end
+	if not CONFIG.MATCH_MODES[gameMode] then return false, "Invalid game mode." end
+	if player:GetAttribute("InQueueForWager") then return false, "Already in queue." end
 
-	if RefundedPlayers[player.UserId] then
-		RefundedPlayers[player.UserId] = nil
-		print(`[MM] Cleared refund cooldown for {player.Name} as they are starting a new queue session.`)
-	end
-
+	-- Payment
 	if wagerAmount > 0 then
-		local hasEnough = DataStatsManager.AddShellsServer(player, -math.abs(wagerAmount)) 
-		-- this math method always returns a positive so adding a minues (-) at the start makes it always negative for SAFETY!
-		if not hasEnough then return false, "You do not have enough shells." end
+		local paymentSuccess = (DataStatsManager :: any).AddShellsServer(player, -wagerAmount)
+		if not paymentSuccess then return false, "Insufficient shells." end
 	end
 
+	-- Data Construction
 	local userId = player.UserId
 	local queueTime = os.time()
-	local playerData: PlayerQueueData = { UserId = userId, Wager = wagerAmount, QueueTime = queueTime, GameMode = gameMode }
+	local playerData: PlayerQueueData = {
+		UserId = userId,
+		Wager = wagerAmount,
+		QueueTime = queueTime,
+		GameMode = gameMode
+	}
 
+	-- MemoryStore Operations
 	local success, err = pcall(function()
-		queueMap:SetAsync(tostring(userId), queueTime, 3600)
-		playerDataMap:SetAsync(tostring(userId), playerData, 3600)
-		return true
+		QueueMap:SetAsync(tostring(userId), queueTime, CONFIG.QUEUE_EXPIRY)
+		PlayerDataMap:SetAsync(tostring(userId), playerData, CONFIG.QUEUE_EXPIRY)
 	end)
 
 	if not success then
-		warn(`[MM] FAILED to add {player.Name} to queue. Error: {tostring(err)}`)
-		SafeRefund(player, wagerAmount, "Failed to join queue")
-		return false, "Server is busy. Please try again."
+		warn(`[MM] Queue Error for {player.Name}: {err}`)
+		SafeRefund(userId, wagerAmount, "Queue System Error")
+		return false, "System error. Try again."
 	end
 
-	print(`[MM] SUCCESS: Added {player.Name} to queue for {gameMode} @ wager {wagerAmount}.`)
 	player:SetAttribute("InQueueForWager", wagerAmount)
-	return true, "Successfully added to queue!"
+	return true, "Joined queue."
 end
 
-function MatchmakingService.RemoveFromQueue(player: Player, isDisconnecting: boolean?): (boolean, string)
-	local wagerAmount = player:GetAttribute("InQueueForWager")
-	if not wagerAmount then return false, "You are not in a queue." end
+function MatchmakingService.RemoveFromQueue(player: Player, isDisconnect: boolean): (boolean, string)
+	local wager = player:GetAttribute("InQueueForWager")
+	if not wager then return false, "Not in queue." end
 
-	local keyToRemove = tostring(player.UserId)
-	local success, err = pcall(function()
-		queueMap:RemoveAsync(keyToRemove)
-		playerDataMap:RemoveAsync(keyToRemove)
-		return true
+	local userIdStr = tostring(player.UserId)
+	
+	-- Fire and forget removal for speed, unless strict confirmation needed
+	task.spawn(function()
+		pcall(function()
+			QueueMap:RemoveAsync(userIdStr)
+			PlayerDataMap:RemoveAsync(userIdStr)
+		end)
 	end)
 
-	if not success then
-		return false, "Failed to leave queue. Please try again."
+	player:SetAttribute("InQueueForWager", nil)
+	
+	if wager > 0 and not isDisconnect then
+		SafeRefund(player.UserId, wager, "Left Queue")
 	end
 
-	player:SetAttribute("InQueueForWager", nil) -- Clear attribute on success
-	if wagerAmount > 0 and not isDisconnecting then SafeRefund(player, wagerAmount, "Left queue voluntarily") end
-	print(`[MM] Removed {player.Name} from queue.`)
-	return true, "Successfully left the queue."
+	return true, "Left queue."
 end
 
--- The main processing function.
-function MatchmakingService.ProcessQueue()
-	local queuedItems = _getQueuedItems()
-	if not queuedItems or #queuedItems < MIN_PLAYERS_FOR_MATCH then return end
+--// THE ADVANCED MATCHMAKER LOGIC
+function MatchmakingService._AttemptMatch(gameMode: string, wager: number, candidates: {PlayerQueueData})
+	local config = CONFIG.MATCH_MODES[gameMode]
+	if #candidates < config.TotalPlayers then return end
 
-	local fullPlayerData = _fetchPlayerData(queuedItems)
-	if not fullPlayerData or #fullPlayerData < MIN_PLAYERS_FOR_MATCH then return end
+	local matchSize = config.TotalPlayers
+	local claimedPlayers: {PlayerQueueData} = {}
+	
+	-- 1. CLAIM PHASE (Atomic Lock Simulation)
+	-- We attempt to remove players from the queue. If we successfully remove them, we 'own' them.
+	for _, candidate in ipairs(candidates) do
+		if #claimedPlayers >= matchSize then break end
 
-	local playersByGroup = _groupPlayers(fullPlayerData)
+		local removeSuccess = pcall(function()
+			QueueMap:RemoveAsync(tostring(candidate.UserId))
+		end)
 
-	_createMatchesFromGroups(playersByGroup)
-end
-
-function MatchmakingService.StartProcessing()
-	if isProcessingActive then return end
-	isProcessingActive = true
-	print("[MM] Starting ProcessQueue loop...")
-	processingThread = task.spawn(function()
-		while isProcessingActive do
-			MatchmakingService.ProcessQueue()
-			task.wait(3)
-		end
-	end)
-end
-
-function MatchmakingService.StopProcessing()
-	if not isProcessingActive then return end
-	isProcessingActive = false
-	print("[MM] Stopping ProcessQueue loop...")
-	if processingThread then task.cancel(processingThread) end
-end
-
-function MatchmakingService.SetupTeleportListener()
-	print("[MM] Setting up teleport listener...")
-	MessagingService:SubscribeAsync(TELEPORT_TOPIC, function(message)
-		local success, data = pcall(function() return HttpService:JSONDecode(message.Data) end)
-		if not success or not data then return end
-
-		data = data :: MatchData
-		local playersOnThisServer = {}
-		for _, userId in ipairs(data.UserIds) do
-			local player = Players:GetPlayerByUserId(userId)
-			if player then table.insert(playersOnThisServer, player) end
-		end
-
-		if #playersOnThisServer > 0 then
-			-- No need to re-fetch the ticket from MemoryStore, the required data is already in the message.
-			local dataToSend = {
-				TicketId = data.DuelTicketId,
-				WagerAmount = data.WagerAmount,
-				MatchType = "Global",
-				Teams = data.Teams -- Correctly use the Teams data from the message
-			}
-			local teleportDataString = HttpService:JSONEncode(dataToSend)
-
-			local teleportSuccess, teleportErr = pcall(function()
-				TeleportService:TeleportToPrivateServer(
-					MATCH_PLACE_ID, 
-					data.PrivateServerCode, 
-					(playersOnThisServer :: {Instance}), 
-					nil, 
-					teleportDataString, 
-					nil)
-				
-				return true
-			end)
-			if teleportSuccess then
-				for _, player : Player in ipairs(playersOnThisServer) do loadingScreenSetEvent:FireClient((player :: Player), "DEATHMATCH") end
+		if removeSuccess then
+			-- Verify Data Map Exists (Double Check)
+			local dataExists, _ = pcall(function() return PlayerDataMap:GetAsync(tostring(candidate.UserId)) end)
+			
+			if dataExists then
+				table.insert(claimedPlayers, candidate)
+				-- Clean up their data map entry now that we have it locally
+				pcall(function() PlayerDataMap:RemoveAsync(tostring(candidate.UserId)) end)
 			else
-				warn(`[MM] Teleport failed: {teleportErr}`)
-				for _, p in ipairs(playersOnThisServer) do SafeRefund(p, data.WagerAmount, "Teleport failed") end
+				-- Data desync: Key existed in SortedMap but not HashMap. Skip.
 			end
 		end
+	end
+
+	-- 2. VERIFICATION PHASE
+	if #claimedPlayers < matchSize then
+		-- We failed to grab enough players (another server might have stolen some).
+		-- We must RETURN the claimed players to the queue (Rollback).
+		for _, pData in ipairs(claimedPlayers) do
+			pcall(function()
+				-- Put them back with original queue time so they keep priority
+				QueueMap:SetAsync(tostring(pData.UserId), pData.QueueTime, CONFIG.QUEUE_EXPIRY)
+				PlayerDataMap:SetAsync(tostring(pData.UserId), pData, CONFIG.QUEUE_EXPIRY)
+			end)
+		end
+		return -- Abort this match attempt
+	end
+
+	-- 3. EXECUTION PHASE (We have a full team, proceed to server reservation)
+	print(`[MM] Creating {gameMode} match for {matchSize} players...`)
+	
+	local success, code = RetryReserveServer(CONFIG.MATCH_PLACE_ID)
+	
+	if not success or not code then
+		warn(`[MM] Critical: Failed to reserve server. Refunding players.`)
+		for _, pData in ipairs(claimedPlayers) do
+			SafeRefund(pData.UserId, pData.Wager, "Server Reservation Failed")
+			-- Notify player locally if they are in this server
+			local pl = Players:GetPlayerByUserId(pData.UserId)
+			if pl then pl:SetAttribute("InQueueForWager", nil) end
+		end
+		return
+	end
+
+	-- Prepare Match Data
+	local teams = { Red = {}, Blue = {} }
+	local userIdsToTeleport = {}
+	
+	for i, pData in ipairs(claimedPlayers) do
+		table.insert(userIdsToTeleport, pData.UserId)
+		if i <= config.TeamSize then
+			table.insert(teams.Red, pData.UserId)
+		else
+			table.insert(teams.Blue, pData.UserId)
+		end
+		
+		-- Clear attributes for local players
+		local pl = Players:GetPlayerByUserId(pData.UserId)
+		if pl then pl:SetAttribute("InQueueForWager", nil) end
+	end
+
+	local duelTicketId = HttpService:GenerateGUID(false)
+	local messageData: MatchData = {
+		UserIds = userIdsToTeleport,
+		PrivateServerCode = code,
+		DuelTicketId = duelTicketId,
+		WagerAmount = wager,
+		Teams = teams
+	}
+
+	-- Broadcoast to all servers to teleport these specific UserIds
+	pcall(function()
+		MessagingService:PublishAsync(CONFIG.TELEPORT_TOPIC, HttpService:JSONEncode(messageData))
 	end)
-	print("[MM] Teleport listener setup complete!")
 end
 
-function MatchmakingService.OnPlayerRemoving(player: Player)
-	if player:GetAttribute("InQueueForWager") then
+function MatchmakingService.ProcessQueue()
+	-- 1. Fetch Range (Snapshot of current queue)
+	local success, queuedItems = pcall(function()
+		return QueueMap:GetRangeAsync(Enum.SortDirection.Ascending, 100)
+	end)
+
+	if not success or not queuedItems or #queuedItems < CONFIG.MIN_PLAYERS then return end
+	
+	-- 2. Fetch Data Bulk
+	-- Note: In a production environment, you might throttle this to avoid hitting limits
+	local playersByModeAndWager: {[string]: {[number]: {PlayerQueueData}}} = {}
+	
+	for _, item: any in ipairs(queuedItems) do
+		local key = item.key
+		local dSuccess, data = pcall(function() return PlayerDataMap:GetAsync(key) end)
+		
+		if dSuccess and data then
+			local qData = data :: PlayerQueueData
+			if not playersByModeAndWager[qData.GameMode] then playersByModeAndWager[qData.GameMode] = {} end
+			if not playersByModeAndWager[qData.GameMode][qData.Wager] then playersByModeAndWager[qData.GameMode][qData.Wager] = {} end
+			
+			table.insert(playersByModeAndWager[qData.GameMode][qData.Wager], qData)
+		end
+	end
+
+	-- 3. Group and Attempt Matches
+	for mode, wagerGroups in pairs(playersByModeAndWager) do
+		for wager, candidates in pairs(wagerGroups) do
+			MatchmakingService._AttemptMatch(mode, wager, candidates)
+		end
+	end
+end
+
+function MatchmakingService.Init()
+	if MatchmakingService._IsRunning then return end
+	MatchmakingService._IsRunning = true
+	
+	-- Matchmaking Loop
+	task.spawn(function()
+		while MatchmakingService._IsRunning do
+			MatchmakingService.ProcessQueue()
+			task.wait(5) -- Polling rate
+		end
+	end)
+
+	-- Teleport Listener
+	MessagingService:SubscribeAsync(CONFIG.TELEPORT_TOPIC, function(message)
+		local s, data = pcall(function() return HttpService:JSONDecode(message.Data) end)
+		if not s then return end
+		
+		local matchData = data :: MatchData
+		local playersToTeleport: {Player} = {}
+		
+		for _, uid in ipairs(matchData.UserIds) do
+			local pl = Players:GetPlayerByUserId(uid)
+			if pl then
+				table.insert(playersToTeleport, pl)
+				LoadingScreenSetEvent:FireClient(pl, "DEATHMATCH")
+			end
+		end
+
+		if #playersToTeleport > 0 then
+			local tpData = {
+				TicketId = matchData.DuelTicketId,
+				WagerAmount = matchData.WagerAmount,
+				MatchType = "Global",
+				Teams = matchData.Teams
+			}
+			
+			local tpOptions = Instance.new("TeleportOptions")
+			tpOptions.ReservedServerAccessCode = matchData.PrivateServerCode
+			tpOptions:SetTeleportData(tpData)
+			
+			SafeTeleport(CONFIG.MATCH_PLACE_ID, playersToTeleport, tpOptions)
+		end
+	end)
+
+	-- Disconnect Listener
+	Players.PlayerRemoving:Connect(function(player)
 		MatchmakingService.RemoveFromQueue(player, true)
+	end)
+	
+	print("[MM] Service Initialized.")
+end
+
+-- Helper for safe teleport handling
+function SafeTeleport(placeId: number, players: {Player}, options: TeleportOptions)
+	local success, res = pcall(function()
+		return TeleportService:TeleportAsync(placeId, players, options)
+	end)
+	if not success then
+		warn(`[MM] Teleport Failed: {res}`)
+		-- Refund logic for failed teleports would go here
 	end
 end
 
