@@ -9,7 +9,6 @@ local HttpService = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 --// MODULES
--- NOTE: Replace this with your actual Data Manager path
 local DataStatsManager = require(ServerScriptService:WaitForChild("Managers"):WaitForChild("Data"):WaitForChild("DataStatsManager"))
 
 --// TYPES
@@ -66,7 +65,7 @@ local refundDebounce: {[number]: boolean} = {}
 
 --// INTERNAL UTILITIES
 
--- Uses exponential backoff to ensure Roblox API calls don't fail silently
+-- Uses exponential backoff to ensure Roblox API calls don't fail
 local function _safeReserveServer(placeId: number): (boolean, string?)
 	local success, result
 	for i = 1, 3 do
