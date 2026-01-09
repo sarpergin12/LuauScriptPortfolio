@@ -1,7 +1,4 @@
 --!strict
--- DuelMatchmakingService.lua
--- Author: [Your Name/Tag]
--- Purpose: High-performance, multi-server matchmaking with atomic locking and race-condition prevention.
 
 local ServerScriptService = game:GetService("ServerScriptService")
 local MemoryStoreService = game:GetService("MemoryStoreService")
