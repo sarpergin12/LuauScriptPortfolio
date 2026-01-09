@@ -34,7 +34,7 @@ type QueueItem = {
 
 --// CONFIGURATION
 local CONFIG = {
-	QUEUE_MAP = "DuelQueue_SortedMap_v2", -- Changed name to prevent conflicts with old data
+	QUEUE_MAP = "DuelQueue_SortedMap_v2",
 	PLAYER_DATA_MAP = "DuelQueue_PlayerData_HashMap_v2",
 	TELEPORT_TOPIC = "TeleportToDuelSolo",
 	MIN_PLAYERS = 2,
@@ -102,7 +102,7 @@ local function RetryReserveServer(placeId: number): (boolean, string?)
 	return success, code
 end
 
---// MAIN METHODS
+--// MAIN HANDLERS
 
 function MatchmakingService.AddToQueue(player: Player, wagerAmount: number, gameMode: string): (boolean, string)
 	-- Validation
@@ -173,7 +173,7 @@ function MatchmakingService._AttemptMatch(gameMode: string, wager: number, candi
 	local matchSize = config.TotalPlayers
 	local claimedPlayers: {PlayerQueueData} = {}
 	
-	-- 1. CLAIM PHASE (Atomic Lock Simulation)
+	-- CLAIM PHASE (Atomic Lock Simulation)
 	-- We attempt to remove players from the queue. If we successfully remove them, we 'own' them.
 	for _, candidate in ipairs(candidates) do
 		if #claimedPlayers >= matchSize then break end
@@ -183,7 +183,7 @@ function MatchmakingService._AttemptMatch(gameMode: string, wager: number, candi
 		end)
 
 		if removeSuccess then
-			-- Verify Data Map Exists (Double Check)
+			-- Verify Data Map Exists
 			local dataExists, _ = pcall(function() return PlayerDataMap:GetAsync(tostring(candidate.UserId)) end)
 			
 			if dataExists then
@@ -196,7 +196,7 @@ function MatchmakingService._AttemptMatch(gameMode: string, wager: number, candi
 		end
 	end
 
-	-- 2. VERIFICATION PHASE
+	-- VERIFICATION PHASE
 	if #claimedPlayers < matchSize then
 		-- We failed to grab enough players (another server might have stolen some).
 		-- We must RETURN the claimed players to the queue (Rollback).
@@ -210,7 +210,7 @@ function MatchmakingService._AttemptMatch(gameMode: string, wager: number, candi
 		return -- Abort this match attempt
 	end
 
-	-- 3. EXECUTION PHASE (We have a full team, proceed to server reservation)
+	-- EXECUTION PHASE (We have a full team, proceed to server reservation)
 	print(`[MM] Creating {gameMode} match for {matchSize} players...`)
 	
 	local success, code = RetryReserveServer(CONFIG.MATCH_PLACE_ID)
@@ -259,14 +259,14 @@ function MatchmakingService._AttemptMatch(gameMode: string, wager: number, candi
 end
 
 function MatchmakingService.ProcessQueue()
-	-- 1. Fetch Range (Snapshot of current queue)
+	-- Fetch Range (Snapshot of current queue)
 	local success, queuedItems = pcall(function()
 		return QueueMap:GetRangeAsync(Enum.SortDirection.Ascending, 100)
 	end)
 
 	if not success or not queuedItems or #queuedItems < CONFIG.MIN_PLAYERS then return end
 	
-	-- 2. Fetch Data Bulk
+	-- Fetch Data Bulk
 	-- Note: In a production environment, you might throttle this to avoid hitting limits
 	local playersByModeAndWager: {[string]: {[number]: {PlayerQueueData}}} = {}
 	
@@ -283,7 +283,7 @@ function MatchmakingService.ProcessQueue()
 		end
 	end
 
-	-- 3. Group and Attempt Matches
+	-- Group and Attempt Matches
 	for mode, wagerGroups in pairs(playersByModeAndWager) do
 		for wager, candidates in pairs(wagerGroups) do
 			MatchmakingService._AttemptMatch(mode, wager, candidates)
